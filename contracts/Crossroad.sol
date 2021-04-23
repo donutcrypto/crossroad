@@ -721,7 +721,7 @@ contract Crossroad
 
         // update poster orders
         {
-            posterOpenOrderCounts[_poster] = posterOpenOrderCounts[_poster].add(1);
+            posterOpenOrderCounts[_poster] = posterOpenOrderCounts[_poster].sub(1);
 
             mapping(uint256 => uint256) storage _nextOpenOrderIds = posterNextOpenOrderIds[_poster];
             mapping(uint256 => uint256) storage _prevOpenOrderIds = posterPrevOpenOrderIds[_poster];
