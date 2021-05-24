@@ -28,7 +28,8 @@ contract DjinnAutoBuyer
     address public constant wbnbToken = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
 
     // factor for swap fees
-    uint256 public constant SWAP_PERMILLE = 998;
+    uint256 public constant SWAP_PERMILLION_PCS1 = 998000;
+    uint256 public constant SWAP_PERMILLION_PCS2 = 997500;
 
     /* ======== STATE VARIABLES ======== */
 
@@ -40,11 +41,15 @@ contract DjinnAutoBuyer
         operator = msg.sender;
     }
 
+    /* ======== EVENTS ======== */
+
+    event BoughtToken(uint256 amount);
+
     /* ======== MODIFIER ======== */
 
     modifier onlyOperator()
     {
-        require(operator == msg.sender, "Crossroad: Caller is not the operator");
+        require(operator == msg.sender, "DjinnAutoBuyer: Caller is not the operator");
         _;
     }
 
@@ -54,13 +59,16 @@ contract DjinnAutoBuyer
         uint256 _amountOut
         ) public view returns (uint256)
     {
-        uint256 _amountInBusd = amountIn(lpDjinnBusd, false, _amountOut);
-        uint256 _amountInWbnb = amountIn(lpWbnbBusd, true, _amountInBusd);
+        uint256 _amountInBusd = amountIn(lpDjinnBusd, false, _amountOut, SWAP_PERMILLION_PCS1);
+        uint256 _amountInWbnb = amountIn(lpWbnbBusd, true, _amountInBusd, SWAP_PERMILLION_PCS2);
         return _amountInWbnb;
     }
 
     function amountIn(
-        address _pool, bool _forward, uint256 _amountOut
+        address _pool,
+        bool _forward,
+        uint256 _amountOut,
+        uint256 _swapPerMillionRate
         ) public view returns (uint256)
     {
         uint256 _initReserveIn;
@@ -74,27 +82,57 @@ contract DjinnAutoBuyer
             (_initReserveOut,_initReserveIn,) = IUniswapPool(_pool).getReserves();
         }
 
-        uint256 _initBalanceIn = _initReserveIn.mul(1000);
-        uint256 _initBalanceOut = _initReserveOut.mul(1000);
+        uint256 _initBalanceIn = _initReserveIn.mul(1000000);
+        uint256 _initBalanceOut = _initReserveOut.mul(1000000);
 
         uint256 _initProduct = _initBalanceIn.mul(_initBalanceOut);
 
-        uint256 _finiBalanceOut = _initBalanceOut.sub(_amountOut.mul(1000));
+        uint256 _finiBalanceOut = _initBalanceOut.sub(_amountOut.mul(1000000));
         uint256 _finiBalanceIn = _initProduct.div(_finiBalanceOut);
 
-        return _finiBalanceIn.sub(_initBalanceIn).div(SWAP_PERMILLE).add(1); // add 1 to account for rounding
+        return _finiBalanceIn.sub(_initBalanceIn).div(_swapPerMillionRate).add(1); // add 1 to account for rounding
+    }
+
+    function amountOut(
+        address _pool,
+        bool _forward,
+        uint256 _amountIn,
+        uint256 _swapPerMillionRate
+        ) public view returns (uint256)
+    {
+        uint256 _initReserveIn;
+        uint256 _initReserveOut;
+        if (_forward)
+        {
+            (_initReserveIn,_initReserveOut,) = IUniswapPool(_pool).getReserves();
+        }
+        else
+        {
+            (_initReserveOut,_initReserveIn,) = IUniswapPool(_pool).getReserves();
+        }
+
+        uint256 _initBalanceIn = _initReserveIn.mul(1000000);
+        uint256 _initBalanceOut = _initReserveOut.mul(1000000);
+
+        uint256 _initProduct = _initBalanceIn.mul(_initBalanceOut);
+
+        uint256 _finiBalanceIn = _initBalanceIn.add(_amountIn.mul(_swapPerMillionRate));
+        uint256 _finiBalanceOut = _initProduct.div(_finiBalanceIn);
+
+        return _initReserveOut.sub(_finiBalanceOut.div(1000000)).sub(1); // sub 1 to account for rounding;
     }
 
     /* ======== USER FUNCTIONS ======== */
 
-    function buyDjinn(
+    function buyTokenFixed(
         uint256 _amountOut,
         address _outTarget,
         address _refundTarget
-        ) external payable returns (uint256)
+        ) external payable
+        returns (uint256)
     {
-        uint256 _amountInBusd = amountIn(lpDjinnBusd, false, _amountOut);
-        uint256 _amountInWbnb = amountIn(lpWbnbBusd, true, _amountInBusd);
+        uint256 _amountInBusd = amountIn(lpDjinnBusd, false, _amountOut, SWAP_PERMILLION_PCS1);
+        uint256 _amountInWbnb = amountIn(lpWbnbBusd, true, _amountInBusd, SWAP_PERMILLION_PCS2);
 
         require(_amountInWbnb <= msg.value, "DjinnAutoBuyer: Insufficient BNB");
 
@@ -109,19 +147,45 @@ contract DjinnAutoBuyer
         // refund excess BNB
         TransferHelper.safeTransferETH(_refundTarget,_amountRefund);
 
+        emit BoughtToken(_amountOut);
         return _amountRefund;
+    }
+
+    function buyTokenFromBnb(
+        address _outTarget
+        ) external payable
+    {
+        uint256 _amountOutBusd = amountOut(lpWbnbBusd, true, msg.value, SWAP_PERMILLION_PCS2);
+        uint256 _amountOutDjinn = amountOut(lpDjinnBusd, false, _amountOutBusd, SWAP_PERMILLION_PCS1);
+
+        // execute swap and transfer djinn to sender
+        IWETH(wbnbToken).deposit{value: msg.value}();
+        IWETH(wbnbToken).transfer(lpWbnbBusd, msg.value);
+        IUniswapPool(lpWbnbBusd).swap(0, _amountOutBusd, lpDjinnBusd, new bytes(0));
+        IUniswapPool(lpDjinnBusd).swap(_amountOutDjinn, 0, _outTarget, new bytes(0));
+
+        emit BoughtToken(_amountOutDjinn);
     }
 
     /* ======== PROXY FUNCTIONS ======== */
 
-    function pancakeCall(address sender, uint amount0, uint amount1, bytes calldata data) external
+    function pancakeCall(
+        address sender,
+        uint amount0,
+        uint amount1,
+        bytes calldata data
+        ) external
     {
         /* do nothing */
     }
 
     /* ======== OPERATOR FUNCTIONS ======== */
 
-    function recoverUnsupported(IERC20 _token, uint256 _amount, address _to) external onlyOperator
+    function recoverUnsupported(
+        IERC20 _token,
+        uint256 _amount,
+        address _to
+        ) external onlyOperator
     {
         // do not allow to drain core tokens
         _token.safeTransfer(_to, _amount);

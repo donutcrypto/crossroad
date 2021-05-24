@@ -3,11 +3,11 @@
 pragma solidity 0.8.3;
 
 import "@openzeppelin/contracts/utils/math/Math.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-import "./interfaces/IDjinnAutoBuyer.sol";
+import "./interfaces/ICrossroadCallee.sol";
+import "./interfaces/ITokenAutoBuyer.sol";
 import "./interfaces/IWETH.sol";
 
 import "./utils/TransferHelper.sol";
@@ -16,7 +16,6 @@ contract Crossroad
 {
     using SafeERC20 for IERC20;
     using Address for address;
-    using SafeMath for uint256;
 
     /* ======== DATA STRUCTURES ======== */
 
@@ -28,19 +27,13 @@ contract Crossroad
         FILLED
     }
 
-    enum ErrorCode
-    {
-        NONE,
-        WITHDRAW_INSUFFICIENT_ALLOWANCE,
-        WITHDRAW_INSUFFICIENT_BALANCE
-    }
-
     // to denote BNB, a value of 0x0 will be used for tokenIn and tokenOut
     struct Order
     {
         address poster;
         address tokenIn;
         address tokenOut;
+        address tokenReward;
         uint256 amountIn;
         uint256 amountOut;
         uint256 expiryTime;
@@ -50,7 +43,6 @@ contract Crossroad
     struct OrderState
     {
         OrderStatus status;
-        ErrorCode error;
         uint256 remainingIn;
         uint256 remainingOut;
         uint256 remainingReward;
@@ -63,7 +55,6 @@ contract Crossroad
 
     // tokens
     address public constant wbnbToken = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
-    address public constant feeToken = 0x24eacCa1086F2904962a32732590F27Ca45D1d99;
 
     /* ======== STATE VARIABLES ======== */
 
@@ -75,33 +66,49 @@ contract Crossroad
     mapping(uint256 => Order) public orders;
     mapping(uint256 => OrderState) public orderStates;
 
-    uint256 openOrderCount;
+    // records
+    uint256 public openOrderCount;
     mapping(uint256 => uint256) nextOpenOrderIds;
     mapping(uint256 => uint256) prevOpenOrderIds;
 
-    mapping(address => uint256) posterOrderCounts;
+    mapping(address => uint256) public posterOrderCounts;
     mapping(address => mapping(uint256 => uint256)) posterNextOrderIds;
     mapping(address => mapping(uint256 => uint256)) posterPrevOrderIds;
-    mapping(address => uint256) posterOpenOrderCounts;
+    mapping(address => uint256) public posterOpenOrderCounts;
     mapping(address => mapping(uint256 => uint256)) posterNextOpenOrderIds;
     mapping(address => mapping(uint256 => uint256)) posterPrevOpenOrderIds;
 
     // fees
-    uint256 public feeAmount = 500e14;
     address public projectAddress = address(0x74031C7504499FD54b42f8e3E90061E5c01C5668);
-    address public feeAutobuyer = address(0x348c4eB1a1be165a1E32C3a6f9d187feEA283B3d);
+    address public feeToken = address(0x24eacCa1086F2904962a32732590F27Ca45D1d99);
+    address public feeAutoBuyer = address(0xd155Ff0EBf2064B7F6BCb0cEC7AD4C89E8a38737);
+    uint256 public feeAmount = 500e14;
 
     // the minimum reward required to activate the auto fill feature
     // this value is purely used communicate to the UI and other potential contracts
     // if this value increases, previously submitted transactions which were activated will persist
     uint256 public autoFillReward = 500e14;
 
-    constructor()
+    constructor(
+        address _projectAddress,
+        address _feeToken,
+        address _feeAutoBuyer
+        )
     {
         operator = msg.sender;
+
+        projectAddress = _projectAddress;
+        feeToken = _feeToken;
+        feeAutoBuyer = _feeAutoBuyer;
     }
 
     /* ======== EVENTS ======== */
+
+    event OrderPlaced(uint256 indexed orderId, address indexed tokenIn, address indexed tokenOut);
+    event OrderRenewed(uint256 indexed orderId);
+    event OrderCancelled(uint256 indexed orderId);
+    event OrderFilledPartial(uint256 indexed orderId);
+    event OrderFilledComplete(uint256 indexed orderId);
 
     /* ======== MODIFIER ======== */
 
@@ -111,17 +118,120 @@ contract Crossroad
         _;
     }
 
+    /* ======== FALLBACK FUNCTIONS ======== */
+
+    receive() external payable {
+    }
+
     /* ======== PUBLIC VIEW FUNCTIONS ======== */
 
     // orders
+    function orderPoster(
+        uint256 _orderId
+        ) public view
+        returns (address)
+    {
+        return orders[_orderId].poster;
+    }
+
+    function orderTokenIn(
+        uint256 _orderId
+        ) public view
+        returns (address)
+    {
+        return orders[_orderId].tokenIn;
+    }
+
+    function orderTokenOut(
+        uint256 _orderId
+        ) public view
+        returns (address)
+    {
+        return orders[_orderId].tokenOut;
+    }
+
+    function orderTokenReward(
+        uint256 _orderId
+        ) public view
+        returns (address)
+    {
+        return orders[_orderId].tokenReward;
+    }
+
+    function orderAmountIn(
+        uint256 _orderId
+        ) public view
+        returns (uint256)
+    {
+        return orders[_orderId].amountIn;
+    }
+
+    function orderAmountOut(
+        uint256 _orderId
+        ) public view
+        returns (uint256)
+    {
+        return orders[_orderId].amountOut;
+    }
+
+    function orderExpiryTime(
+        uint256 _orderId
+        ) public view
+        returns (uint256)
+    {
+        return orders[_orderId].expiryTime;
+    }
+
+    function orderDeposit(
+        uint256 _orderId
+        ) public view
+        returns (bool)
+    {
+        return orders[_orderId].deposit;
+    }
+
+    // order states
+    function orderStatus(
+        uint256 _orderId
+        ) public view
+        returns (OrderStatus)
+    {
+        return orderStates[_orderId].status;
+    }
+
+    function orderRemainingIn(
+        uint256 _orderId
+        ) external view
+        returns (uint256)
+    {
+        return orderStates[_orderId].remainingIn;
+    }
+
+    function orderRemainingOut(
+        uint256 _orderId
+        ) external view
+        returns (uint256)
+    {
+        return orderStates[_orderId].remainingOut;
+    }
+
+    function orderRemainingReward(
+        uint256 _orderId
+        ) external view
+        returns (uint256)
+    {
+        return orderStates[_orderId].remainingReward;
+    }
+
     function orderCanBeFilled(
         uint256 _orderId
         ) public view
         returns (bool)
     {
-        Order storage order = orders[_orderId];
-        OrderState storage state = orderStates[_orderId];
-        return state.status == OrderStatus.OPEN && block.timestamp < order.expiryTime;
+        return
+            block.timestamp < orders[_orderId].expiryTime &&
+            orderStates[_orderId].status == OrderStatus.OPEN
+            ;
     }
 
     function orderCanBeFilledCompleteCheckAllowanceAndBalance(
@@ -138,36 +248,6 @@ contract Crossroad
             state.remainingIn < IERC20(order.tokenIn).balanceOf(order.poster) &&
             state.remainingIn < IERC20(order.tokenIn).allowance(order.poster,address(this))
             ;
-    }
-
-    function orderRemainingIn(
-        uint256 _orderId
-        ) external view
-        returns (uint256)
-    {
-        OrderState storage state = orderStates[_orderId];
-        if (!orderCanBeFilled(_orderId)) return 0;
-        return state.remainingIn;
-    }
-
-    function orderRemainingOut(
-        uint256 _orderId
-        ) external view
-        returns (uint256)
-    {
-        OrderState storage state = orderStates[_orderId];
-        if (!orderCanBeFilled(_orderId)) return 0;
-        return state.remainingOut;
-    }
-
-    function orderRemainingReward(
-        uint256 _orderId
-        ) external view
-        returns (uint256)
-    {
-        OrderState storage state = orderStates[_orderId];
-        if (!orderCanBeFilled(_orderId)) return 0;
-        return state.remainingReward;
     }
 
     function orderRemainingInCheckAllowanceAndBalance(
@@ -197,8 +277,9 @@ contract Crossroad
     {
         OrderState storage state = orderStates[_orderId];
         if (!orderCanBeFilled(_orderId)) return 0;
+        if (state.remainingOut <= _amountOut) return state.remainingIn;
 
-        return state.remainingIn.mul(_amountOut).div(state.remainingOut);
+        return (state.remainingIn * _amountOut) / state.remainingOut;
     }
 
     function orderAmountRewardFromAmountOut(
@@ -209,8 +290,9 @@ contract Crossroad
     {
         OrderState storage state = orderStates[_orderId];
         if (!orderCanBeFilled(_orderId)) return 0;
+        if (state.remainingOut <= _amountOut) return state.remainingReward;
 
-        return state.remainingReward.mul(_amountOut).div(state.remainingOut);
+        return (state.remainingReward * _amountOut) / state.remainingOut;
     }
 
     // records
@@ -227,7 +309,7 @@ contract Crossroad
             )
         {
             _openOrderIds[_index] = _currOpenOrderId;
-            _index.add(1);
+            _index += 1;
         }
         return _openOrderIds;
     }
@@ -239,7 +321,7 @@ contract Crossroad
     {
         mapping(uint256 => uint256) storage _nextOrderIds = posterNextOrderIds[_poster];
 
-        uint256[] memory _openIds;
+        uint256[] memory _openIds = new uint256[](posterOrderCounts[_poster]);
         uint256 _index = 0;
         for (
             uint256 _currOrderId = _nextOrderIds[0];
@@ -248,7 +330,7 @@ contract Crossroad
             )
         {
             _openIds[_index] = _currOrderId;
-            _index.add(1);
+            _index += 1;
         }
         return _openIds;
     }
@@ -260,7 +342,7 @@ contract Crossroad
     {
         mapping(uint256 => uint256) storage _nextOpenOrderIds = posterNextOpenOrderIds[_poster];
 
-        uint256[] memory _openOrderIds;
+        uint256[] memory _openOrderIds = new uint256[](posterOpenOrderCounts[_poster]);
         uint256 _index = 0;
         for (
             uint256 _currOpenOrderId = _nextOpenOrderIds[0];
@@ -269,14 +351,14 @@ contract Crossroad
             )
         {
             _openOrderIds[_index] = _currOpenOrderId;
-            _index.add(1);
+            _index += 1;
         }
         return _openOrderIds;
     }
 
     /* ======== USER FUNCTIONS ======== */
 
-    function placeOrderPayFee(
+    function postOrderPayFee(
         address _tokenIn,
         address _tokenOut,
         uint256 _amountIn,
@@ -284,14 +366,17 @@ contract Crossroad
         uint256 _expiryTime,
         bool _deposit,
         uint256 _rewardAmount
-        ) external
+        ) external returns (uint256 orderId_)
     {
+        require(_tokenIn != address(0), "Crossroad: Wrong function call");
         require(_tokenIn != _tokenOut, "Crossroad: Cannot trade a token for itself");
+        require(0 < _amountIn, "Crossroad: Cannot trade nothing");
+        require(0 < _amountOut, "Crossroad: Cannot trade nothing");
 
         depositTokenIn(_tokenIn,_amountIn,_deposit);
         payFee(_rewardAmount);
 
-        createOrder(
+        orderId_ = createOrder(
             _tokenIn,
             _tokenOut,
             _amountIn,
@@ -302,7 +387,7 @@ contract Crossroad
             );
     }
 
-    function placeOrderBuyFee(
+    function postOrderBuyFee(
         address _tokenIn,
         address _tokenOut,
         uint256 _amountIn,
@@ -310,14 +395,17 @@ contract Crossroad
         uint256 _expiryTime,
         bool _deposit,
         uint256 _rewardAmount
-        ) external payable
+        ) external payable returns (uint256 orderId_)
     {
+        require(_tokenIn != address(0), "Crossroad: Wrong function call");
         require(_tokenIn != _tokenOut, "Crossroad: Cannot trade a token for itself");
+        require(0 < _amountIn, "Crossroad: Cannot trade nothing");
+        require(0 < _amountOut, "Crossroad: Cannot trade nothing");
 
         depositTokenIn(_tokenIn,_amountIn,_deposit);
         buyFee(msg.value,_rewardAmount);
 
-        createOrder(
+        orderId_ = createOrder(
             _tokenIn,
             _tokenOut,
             _amountIn,
@@ -328,18 +416,20 @@ contract Crossroad
             );
     }
 
-    function placeOrderInBnbPayFee(
+    function postOrderInBnbPayFee(
         address _tokenOut,
         uint256 _amountOut,
         uint256 _expiryTime,
         uint256 _rewardAmount
-        ) external payable
+        ) external payable returns (uint256 orderId_)
     {
         require(address(0) != _tokenOut, "Crossroad: Cannot trade a token for itself");
+        require(0 < msg.value, "Crossroad: Cannot trade nothing");
+        require(0 < _amountOut, "Crossroad: Cannot trade nothing");
 
         payFee(_rewardAmount);
 
-        createOrder(
+        orderId_ = createOrder(
             address(0),
             _tokenOut,
             msg.value,
@@ -350,20 +440,22 @@ contract Crossroad
             );
     }
 
-    function placeOrderInBnbBuyFee(
+    function postOrderInBnbBuyFee(
         address _tokenOut,
         uint256 _amountIn,
         uint256 _amountOut,
         uint256 _expiryTime,
         uint256 _rewardAmount
-        ) external payable
+        ) external payable returns (uint256 orderId_)
     {
         require(address(0) != _tokenOut, "Crossroad: Cannot trade a token for itself");
+        require(0 < _amountIn, "Crossroad: Cannot trade nothing");
+        require(0 < _amountOut, "Crossroad: Cannot trade nothing");
 
-        uint256 _feeBnbAmount = msg.value.sub(_amountIn);
+        uint256 _feeBnbAmount = msg.value - _amountIn;
         buyFee(_feeBnbAmount,_rewardAmount);
 
-        createOrder(
+        orderId_ = createOrder(
             address(0),
             _tokenOut,
             _amountIn,
@@ -385,6 +477,8 @@ contract Crossroad
         require(order.poster == msg.sender, "Crossroad: Can't renew another poster's order");
         require(state.status == OrderStatus.OPEN, "Crossroad: Order is not open");
 
+        emit OrderRenewed(_orderId);
+
         order.expiryTime = _expiryTime;
     }
 
@@ -392,6 +486,8 @@ contract Crossroad
         uint256 _orderId
         ) external
     {
+        require(_orderId != 0 && _orderId <= orderCount, "Crossroad: Invalid order");
+
         Order storage order = orders[_orderId];
         OrderState storage state = orderStates[_orderId];
 
@@ -401,7 +497,9 @@ contract Crossroad
         // mark as cancelled
         state.status = OrderStatus.CANCELLED;
         // remove from record keeping
-        recordCloseOrder(msg.sender, _orderId);
+        recordCloseOrder(order.poster, _orderId);
+
+        emit OrderCancelled(_orderId);
 
         // update amounts
         uint256 _amountIn = state.remainingIn;
@@ -425,129 +523,101 @@ contract Crossroad
         }
 
         // refund any remaining reward
-        IERC20(feeToken).safeTransfer(order.poster,_amountReward);
+        IERC20(order.tokenReward).safeTransfer(order.poster,_amountReward);
     }
 
-    function fillOrderPartial(
+    function fillOrderOutToken(
         uint256 _orderId,
-        uint256 _amountOut
+        uint256 _amountOut,
+        address _to,
+        bool _callback,
+        bytes calldata _callbackData
         ) external
     {
+        require(_orderId != 0 && _orderId <= orderCount, "Crossroad: Invalid order");
+
         Order storage order = orders[_orderId];
         OrderState storage state = orderStates[_orderId];
 
         require(address(0) != order.tokenOut, "Crossroad: Wrong function call");
-        require(state.status == OrderStatus.OPEN, "Crossroad: Order is not open");
-        require(block.timestamp < order.expiryTime, "Crossroad: Order has expired");
-        require(_amountOut <= state.remainingOut, "Crossroad: Filling more than remaining amount");
 
-        if (_amountOut == state.remainingOut)
+        uint256 _amountIn;
+        uint256 _amountReward;
+        (_amountIn,_amountOut,_amountReward) = processFillOrder(_orderId,order,state,_amountOut);
+
+        // transfer token in to caller
+        transferTokenInToCaller(_orderId,_amountIn,_to);
+
+        // transfer reward to caller
+        IERC20(order.tokenReward).safeTransfer(_to,_amountReward);
+
+        // crossroad callback
+        if (_callback)
         {
-            // mark as filled
-            state.status = OrderStatus.FILLED;
-            // remove from record keeping
-            recordCloseOrder(msg.sender, _orderId);
+            ICrossroadCallee(_to).crossroadCall(
+                msg.sender,
+                _amountIn,
+                _amountOut,
+                _amountReward,
+                _callbackData
+                );
         }
 
-        // update amounts
-        uint256 _amountIn = state.remainingIn.mul(_amountOut).div(state.remainingOut);
-        uint256 _amountReward = state.remainingReward.mul(_amountOut).div(state.remainingOut);
-
-        state.remainingIn = state.remainingIn.sub(_amountIn);
-        state.remainingOut = state.remainingOut.sub(_amountOut);
-        state.remainingReward = state.remainingReward.sub(_amountReward);
-
-        // transfer token in to caller
-        transferTokenInToCaller(_orderId,_amountIn);
-        
         // transfer token out to poster
-        IERC20(order.tokenOut).safeTransferFrom(msg.sender,order.poster,_amountOut);
-
-        // transfer reward to caller
-        IERC20(feeToken).safeTransfer(msg.sender,_amountReward);
-    }
-
-    function fillOrderComplete(
-        uint256 _orderId
-        ) external
-    {
-        Order storage order = orders[_orderId];
-        OrderState storage state = orderStates[_orderId];
-
-        require(address(0) != order.tokenOut, "Crossroad: Wrong function call");
-        require(state.status == OrderStatus.OPEN, "Crossroad: Order is not open");
-        require(block.timestamp < order.expiryTime, "Crossroad: Order has expired");
-
-        // mark as filled
-        state.status = OrderStatus.FILLED;
-        // remove from record keeping
-        recordCloseOrder(msg.sender, _orderId);
-
-        // update amounts
-        uint256 _amountIn = state.remainingIn;
-        uint256 _amountOut = state.remainingOut;
-        uint256 _amountReward = state.remainingReward;
-
-        state.remainingIn = 0;
-        state.remainingOut = 0;
-        state.remainingReward = 0;
-
-        // transfer token in to caller
-        transferTokenInToCaller(_orderId,_amountIn);
-        
-        // transfer token out to poster
-        IERC20(order.tokenOut).safeTransferFrom(msg.sender,order.poster,_amountOut);
-
-        // transfer reward to caller
-        IERC20(feeToken).safeTransfer(msg.sender,_amountReward);
+        IERC20(order.tokenOut).safeTransferFrom(_to,order.poster,_amountOut);
     }
 
     function fillOrderOutBnb(
-        uint256 _orderId
+        uint256 _orderId,
+        uint256 _amountOut,
+        address _to,
+        bool _callback,
+        bytes calldata _callbackData
         ) external payable
     {
+        require(_orderId != 0 && _orderId <= orderCount, "Crossroad: Invalid order");
+
         Order storage order = orders[_orderId];
         OrderState storage state = orderStates[_orderId];
 
         require(address(0) == order.tokenOut, "Crossroad: Wrong function call");
-        require(state.status == OrderStatus.OPEN, "Crossroad: Order is not open");
-        require(block.timestamp < order.expiryTime, "Crossroad: Order has expired");
-        require(msg.value <= state.remainingOut, "Crossroad: Filling more than remaining amount");
 
-        if (msg.value == state.remainingOut)
-        {
-            // mark as filled
-            state.status = OrderStatus.FILLED;
-            // remove from record keeping
-            recordCloseOrder(msg.sender, _orderId);
-        }
-
-        // update amounts
-        uint256 _amountIn = state.remainingIn.mul(msg.value).div(state.remainingOut);
-        uint256 _amountReward = state.remainingReward.mul(msg.value).div(state.remainingOut);
-
-        state.remainingIn = state.remainingIn.sub(_amountIn);
-        state.remainingOut = state.remainingOut.sub(msg.value);
-        state.remainingReward = state.remainingReward.sub(_amountReward);
+        uint256 _amountIn;
+        uint256 _amountReward;
+        (_amountIn,_amountOut,_amountReward) = processFillOrder(_orderId,order,state,_amountOut);
 
         // transfer token in to caller
-        transferTokenInToCaller(_orderId,_amountIn);
-        
-        // transfer token out to poster
-        TransferHelper.safeTransferETH(order.poster,msg.value);
+        transferTokenInToCaller(_orderId,_amountIn,_to);
 
         // transfer reward to caller
-        IERC20(feeToken).safeTransfer(msg.sender,_amountReward);
+        IERC20(order.tokenReward).safeTransfer(_to,_amountReward);
+
+        // crossroad callback
+        uint256 _totalValue = msg.value;
+        if (_callback)
+        {
+            uint256 _prevBalanceBnb = address(this).balance;
+            ICrossroadCallee(_to).crossroadCall(
+                msg.sender,
+                _amountIn,
+                _amountOut,
+                _amountReward,
+                _callbackData
+                );
+            uint256 _currBalanceBnb = address(this).balance;
+
+            _totalValue += _currBalanceBnb - _prevBalanceBnb;
+        }
+        require(_amountOut <= _totalValue, "Crossroad: Insufficient BNB paid");
+
+        // refund excess BNB
+        TransferHelper.safeTransferETH(msg.sender,_totalValue-_amountOut);
+
+        // transfer token out to poster
+        TransferHelper.safeTransferETH(order.poster,_amountOut);
     }
 
     /* ======== OPERATOR FUNCTIONS ======== */
-
-    function setFeeAmount(
-        uint256 _feeAmount
-        ) external onlyOperator
-    {
-        feeAmount = _feeAmount;
-    }
 
     function setProjectAddress(
         address _projectAddress
@@ -556,11 +626,20 @@ contract Crossroad
         projectAddress = _projectAddress;
     }
 
-    function setFeeAutobuyer(
-        address _feeAutobuyer
+    function setFeeToken(
+        address _feeToken,
+        address _feeAutoBuyer
         ) external onlyOperator
     {
-        feeAutobuyer = _feeAutobuyer;
+        feeToken = _feeToken;
+        feeAutoBuyer = _feeAutoBuyer;
+    }
+
+    function setFeeAmount(
+        uint256 _feeAmount
+        ) external onlyOperator
+    {
+        feeAmount = _feeAmount;
     }
 
     /* ======== INTERNAL VIEW FUNCTIONS ======== */
@@ -580,7 +659,7 @@ contract Crossroad
             uint256 _prevBalance = IERC20(_tokenIn).balanceOf(address(this));
             IERC20(_tokenIn).safeTransferFrom(msg.sender,address(this),_amountIn);
             uint256 _currBalance = IERC20(_tokenIn).balanceOf(address(this));
-            require(_prevBalance.add(_amountIn) == _currBalance, "Crossroad: Transfer fee detected");
+            require(_prevBalance + _amountIn == _currBalance, "Crossroad: Transfer fee detected");
         }
     }
 
@@ -597,11 +676,15 @@ contract Crossroad
         uint256 _rewardAmount
         ) internal
     {
+        uint256 _prevRewardBalance = IERC20(feeToken).balanceOf(address(this));
+
         // buy fee and reward
         // transfer fee to project
-        uint256 _feeAndRewardAmount = feeAmount.add(_rewardAmount);
-        IDjinnAutoBuyer(feeAutobuyer).buyDjinn{value: _bnbAmount}(_feeAndRewardAmount,address(this),msg.sender);
+        uint256 _feeAndRewardAmount = feeAmount + _rewardAmount;
+        ITokenAutoBuyer(feeAutoBuyer).buyTokenFixed{value: _bnbAmount}(_feeAndRewardAmount,address(this),msg.sender);
         IERC20(feeToken).safeTransfer(projectAddress,feeAmount);
+
+        require(_prevRewardBalance + _rewardAmount <= IERC20(feeToken).balanceOf(address(this)), "Crossroad: Fee auto buyer error");
     }
 
     function createOrder(
@@ -612,39 +695,43 @@ contract Crossroad
         uint256 _expiryTime,
         bool _deposit,
         uint256 _rewardAmount
-        ) internal
+        ) internal returns (uint256 orderId_)
     {
         // add order
-        orderCount = orderCount.add(1);
-        uint256 _orderId = orderCount;
+        orderCount += 1;
+        orderId_ = orderCount;
 
-        orders[_orderId] = Order(
+        orders[orderId_] = Order(
         {
             poster: msg.sender,
             tokenIn: _tokenIn,
             tokenOut: _tokenOut,
+            tokenReward: feeToken,
             amountIn: _amountIn,
             amountOut: _amountOut,
             expiryTime: _expiryTime,
             deposit: _deposit
         });
 
-        orderStates[_orderId] = OrderState(
+        orderStates[orderId_] = OrderState(
         {
             status: OrderStatus.OPEN,
-            error: ErrorCode.NONE,
             remainingIn: _amountIn,
             remainingOut: _amountOut,
             remainingReward: _rewardAmount
         });
 
         // add to record keeping
-        recordOpenOrder(msg.sender, _orderId);
+        recordOpenOrder(msg.sender, orderId_);
+
+        emit OrderPlaced(orderId_, _tokenIn, _tokenOut);
+        return orderId_;
     }
 
     function transferTokenInToCaller(
         uint256 _orderId,
-        uint256 _amountIn
+        uint256 _amountIn,
+        address _to
         ) internal
     {
         Order storage _order = orders[_orderId];
@@ -653,16 +740,60 @@ contract Crossroad
         {
             if (_order.tokenIn == address(0))
             {
-                TransferHelper.safeTransferETH(msg.sender,_amountIn);
+                TransferHelper.safeTransferETH(_to,_amountIn);
             }
             else
             {
-                IERC20(_order.tokenIn).safeTransfer(msg.sender,_amountIn);
+                IERC20(_order.tokenIn).safeTransfer(_to,_amountIn);
             }
         }
         else
         {
-            IERC20(_order.tokenIn).safeTransferFrom(_order.poster,msg.sender,_amountIn);
+            IERC20(_order.tokenIn).safeTransferFrom(_order.poster,_to,_amountIn);
+        }
+    }
+
+    function processFillOrder(
+        uint256 _orderId,
+        Order storage order,
+        OrderState storage state,
+        uint256 _amountOut
+        ) internal returns (uint256 amountIn_, uint256 amountOut_, uint256 amountReward_)
+    {
+        require(0 < _amountOut, "Crossroad: Cannot trade nothing");
+        require(state.status == OrderStatus.OPEN, "Crossroad: Order is not open");
+        require(block.timestamp < order.expiryTime, "Crossroad: Order has expired");
+
+        amountOut_ = Math.min(_amountOut, state.remainingOut);
+
+        if (amountOut_ == state.remainingOut)
+        {
+            // mark as filled
+            state.status = OrderStatus.FILLED;
+            // remove from record keeping
+            recordCloseOrder(order.poster, _orderId);
+
+            emit OrderFilledComplete(_orderId);
+
+            // update amounts
+            amountIn_ = state.remainingIn;
+            amountReward_ = state.remainingReward;
+
+            state.remainingIn = 0;
+            state.remainingOut = 0;
+            state.remainingReward = 0;
+        }
+        else
+        {
+            emit OrderFilledPartial(_orderId);
+
+            // update amounts
+            amountIn_ = (state.remainingIn * amountOut_) / state.remainingOut;
+            amountReward_ = (state.remainingReward * amountOut_) / state.remainingOut;
+
+            state.remainingIn -= amountIn_;
+            state.remainingOut -= amountOut_;
+            state.remainingReward -= amountReward_;
         }
     }
 
@@ -674,24 +805,28 @@ contract Crossroad
     {
         // update global orders
         {
-            openOrderCount = openOrderCount.add(1);
+            openOrderCount += 1;
 
             uint256 _prevNewestOpenOrderId = prevOpenOrderIds[0];
 
             nextOpenOrderIds[_prevNewestOpenOrderId] = _orderId;
             prevOpenOrderIds[_orderId] = _prevNewestOpenOrderId;
+
+            prevOpenOrderIds[0] = _orderId;
         }
 
         // update poster orders
         {
-            posterOrderCounts[_poster] = posterOrderCounts[_poster].add(1);
-            posterOpenOrderCounts[_poster] = posterOpenOrderCounts[_poster].add(1);
+            posterOrderCounts[_poster] += 1;
+            posterOpenOrderCounts[_poster] += 1;
 
             {
                 uint256 _prevPosterNewestOrderId = posterPrevOrderIds[_poster][0];
 
                 posterNextOrderIds[_poster][_prevPosterNewestOrderId] = _orderId;
                 posterPrevOrderIds[_poster][_orderId] = _prevPosterNewestOrderId;
+
+                posterPrevOrderIds[_poster][0] = _orderId;
             }
 
             {
@@ -699,6 +834,8 @@ contract Crossroad
 
                 posterNextOpenOrderIds[_poster][_prevPosterNewestOpenOrderId] = _orderId;
                 posterPrevOpenOrderIds[_poster][_orderId] = _prevPosterNewestOpenOrderId;
+
+                posterPrevOpenOrderIds[_poster][0] = _orderId;
             }
         }
     }
@@ -710,7 +847,7 @@ contract Crossroad
     {
         // update global orders
         {
-            openOrderCount = openOrderCount.sub(1);
+            openOrderCount -= 1;
 
             uint256 _nextOpenOrderId = nextOpenOrderIds[_orderId];
             uint256 _prevOpenOrderId = prevOpenOrderIds[_orderId];
@@ -721,7 +858,7 @@ contract Crossroad
 
         // update poster orders
         {
-            posterOpenOrderCounts[_poster] = posterOpenOrderCounts[_poster].sub(1);
+            posterOpenOrderCounts[_poster] -= 1;
 
             mapping(uint256 => uint256) storage _nextOpenOrderIds = posterNextOpenOrderIds[_poster];
             mapping(uint256 => uint256) storage _prevOpenOrderIds = posterPrevOpenOrderIds[_poster];
