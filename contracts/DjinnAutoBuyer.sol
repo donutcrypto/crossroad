@@ -3,7 +3,6 @@
 pragma solidity 0.8.3;
 
 import "@openzeppelin/contracts/utils/math/Math.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -16,7 +15,6 @@ contract DjinnAutoBuyer
 {
     using SafeERC20 for IERC20;
     using Address for address;
-    using SafeMath for uint256;
 
     /* ======== DATA STRUCTURES ======== */
 
@@ -24,7 +22,7 @@ contract DjinnAutoBuyer
 
     // swap contracts
     address public constant lpDjinnBusd = 0x03962E1907B0FA72768Bd865e8cA0C45C7De4937;
-    address public constant lpWbnbBusd = 0x1B96B92314C44b159149f7E0303511fB2Fc4774f;
+    address public constant lpWbnbBusd = 0x58F876857a02D6762E0101bb5C46A8c1ED44Dc16;
     address public constant wbnbToken = 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c;
 
     // factor for swap fees
@@ -82,15 +80,15 @@ contract DjinnAutoBuyer
             (_initReserveOut,_initReserveIn,) = IUniswapPool(_pool).getReserves();
         }
 
-        uint256 _initBalanceIn = _initReserveIn.mul(1000000);
-        uint256 _initBalanceOut = _initReserveOut.mul(1000000);
+        uint256 _initBalanceIn = _initReserveIn * 1000000;
+        uint256 _initBalanceOut = _initReserveOut * 1000000;
 
-        uint256 _initProduct = _initBalanceIn.mul(_initBalanceOut);
+        uint256 _initProduct = _initBalanceIn * _initBalanceOut;
 
-        uint256 _finiBalanceOut = _initBalanceOut.sub(_amountOut.mul(1000000));
-        uint256 _finiBalanceIn = _initProduct.div(_finiBalanceOut);
+        uint256 _finiBalanceOut = _initBalanceOut - (_amountOut * 1000000);
+        uint256 _finiBalanceIn = _initProduct / _finiBalanceOut;
 
-        return _finiBalanceIn.sub(_initBalanceIn).div(_swapPerMillionRate).add(1); // add 1 to account for rounding
+        return (_finiBalanceIn - _initBalanceIn) / _swapPerMillionRate + 1; // add 1 to account for rounding
     }
 
     function amountOut(
@@ -111,15 +109,15 @@ contract DjinnAutoBuyer
             (_initReserveOut,_initReserveIn,) = IUniswapPool(_pool).getReserves();
         }
 
-        uint256 _initBalanceIn = _initReserveIn.mul(1000000);
-        uint256 _initBalanceOut = _initReserveOut.mul(1000000);
+        uint256 _initBalanceIn = _initReserveIn * 1000000;
+        uint256 _initBalanceOut = _initReserveOut * 1000000;
 
-        uint256 _initProduct = _initBalanceIn.mul(_initBalanceOut);
+        uint256 _initProduct = _initBalanceIn * _initBalanceOut;
 
-        uint256 _finiBalanceIn = _initBalanceIn.add(_amountIn.mul(_swapPerMillionRate));
-        uint256 _finiBalanceOut = _initProduct.div(_finiBalanceIn);
+        uint256 _finiBalanceIn = _initBalanceIn + (_amountIn * _swapPerMillionRate);
+        uint256 _finiBalanceOut = _initProduct / _finiBalanceIn;
 
-        return _initReserveOut.sub(_finiBalanceOut.div(1000000)).sub(1); // sub 1 to account for rounding;
+        return _initReserveOut - (_finiBalanceOut / 1000000) - 1; // sub 1 to account for rounding;
     }
 
     /* ======== USER FUNCTIONS ======== */
@@ -136,7 +134,7 @@ contract DjinnAutoBuyer
 
         require(_amountInWbnb <= msg.value, "DjinnAutoBuyer: Insufficient BNB");
 
-        uint256 _amountRefund = msg.value.sub(_amountInWbnb);
+        uint256 _amountRefund = msg.value - _amountInWbnb;
 
         // execute swap and transfer djinn to sender
         IWETH(wbnbToken).deposit{value: _amountInWbnb}();
@@ -152,11 +150,14 @@ contract DjinnAutoBuyer
     }
 
     function buyTokenFromBnb(
-        address _outTarget
+        address _outTarget,
+        uint256 _amountOutMin
         ) external payable
     {
         uint256 _amountOutBusd = amountOut(lpWbnbBusd, true, msg.value, SWAP_PERMILLION_PCS2);
         uint256 _amountOutDjinn = amountOut(lpDjinnBusd, false, _amountOutBusd, SWAP_PERMILLION_PCS1);
+
+        require(_amountOutMin <= _amountOutDjinn, "DjinnAutoBuyer: Slippage exceeded");
 
         // execute swap and transfer djinn to sender
         IWETH(wbnbToken).deposit{value: msg.value}();

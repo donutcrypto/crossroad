@@ -3,7 +3,6 @@
 pragma solidity 0.8.3;
 
 import "@openzeppelin/contracts/utils/math/Math.sol";
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -17,7 +16,6 @@ contract LiquidityProxy
 {
     using SafeERC20 for IERC20;
     using Address for address;
-    using SafeMath for uint256;
 
     /* ======== DATA STRUCTURES ======== */
 
@@ -34,12 +32,16 @@ contract LiquidityProxy
     // governance
     address public operator;
 
+    // fee
+    uint256 public feeAmount = 7e14;
+    mapping(address => bool) public feeExcluded;
+
     constructor()
     {
         operator = msg.sender;
     }
 
-    /* ======== MODIFIER ======== */
+    /* ======== MODIFIERS ======== */
 
     modifier onlyOperator()
     {
@@ -47,9 +49,25 @@ contract LiquidityProxy
         _;
     }
 
+    /* ======== EVENTS ======== */
+
+    event FeeAmountChanged(uint256 feeAmount);
+    event TokenExclusionChanged(address indexed token, bool excluded);
+
     /* ======== FALLBACK FUNCTIONS ======== */
 
     receive() external payable {
+    }
+
+    /* ======== PUBLIC VIEW FUNCTIONS ======== */
+
+    function liquidityFee(
+        address _tokenA,
+        address _tokenB
+        ) public view
+        returns(uint256)
+    {
+        return feeExcluded[_tokenA] || feeExcluded[_tokenB] ? 0 : feeAmount;
     }
 
     /* ======== USER FUNCTIONS ======== */
@@ -64,8 +82,12 @@ contract LiquidityProxy
         uint _amountAMin,
         uint _amountBMin,
         address _to
-        ) external payable returns (uint amountA_, uint amountB_, uint liquidity_)
+        ) external payable
+        returns (uint amountA_, uint amountB_, uint liquidity_)
     {
+        uint256 _liquidityFee = liquidityFee(_tokenA, _tokenB);
+        require(_liquidityFee <= msg.value, "LiquidityProxy: Insufficient fee");
+
         factoryEnsurePairExistsInner(_factory,_tokenA,_tokenB);
 
         (amountA_, amountB_) = getAddLiquidityAmountsInner(
@@ -80,6 +102,12 @@ contract LiquidityProxy
         IERC20(_tokenA).safeTransferFrom(msg.sender, _tokenLp, amountA_);
         IERC20(_tokenB).safeTransferFrom(msg.sender, _tokenLp, amountB_);
         liquidity_ = IUniswapPool(_tokenLp).mint(_to);
+
+        // refund excess bnb
+        if (msg.value > _liquidityFee)
+        {
+            TransferHelper.safeTransferETH(msg.sender, msg.value - _liquidityFee);
+        }
     }
 
     function addLiquidityBnb(
@@ -91,9 +119,11 @@ contract LiquidityProxy
         uint _amountTokenMin,
         uint _amountBnbMin,
         address _to
-        ) external payable returns (uint amountToken_, uint amountBnb_, uint liquidity_)
+        ) external payable
+        returns (uint amountToken_, uint amountBnb_, uint liquidity_)
     {
-        require(_amountBnbDesired <= msg.value, "LiquidityProxy: Insufficient BNB");
+        uint256 _liquidityFee = liquidityFee(_token, address(0));
+        require(_amountBnbDesired+_liquidityFee <= msg.value, "LiquidityProxy: Insufficient BNB");
 
         factoryEnsurePairExistsInner(_factory,_token,WBNB);
 
@@ -110,8 +140,12 @@ contract LiquidityProxy
         IWETH(WBNB).deposit{value: amountBnb_}();
         IERC20(WBNB).safeTransfer(_tokenLp, amountBnb_);
         liquidity_ = IUniswapPool(_tokenLp).mint(_to);
+
         // refund excess bnb
-        if (_amountBnbDesired > amountBnb_) TransferHelper.safeTransferETH(msg.sender, _amountBnbDesired - amountBnb_);
+        if (msg.value > amountBnb_+_liquidityFee)
+        {
+            TransferHelper.safeTransferETH(msg.sender, msg.value - (amountBnb_+_liquidityFee));
+        }
     }
 
     function removeLiquidity(
@@ -122,8 +156,12 @@ contract LiquidityProxy
         uint _amountAMin,
         uint _amountBMin,
         address _to
-        ) public payable returns (uint amountA_, uint amountB_)
+        ) public payable
+        returns (uint amountA_, uint amountB_)
     {
+        uint256 _liquidityFee = liquidityFee(_tokenA, _tokenB);
+        require(_liquidityFee <= msg.value, "LiquidityProxy: Insufficient fee");
+
         IERC20(_tokenLp).safeTransferFrom(msg.sender, _tokenLp, _liquidity);
         {
             (uint _amount0, uint _amount1) = IUniswapPool(_tokenLp).burn(_to);
@@ -131,6 +169,12 @@ contract LiquidityProxy
         }
         require(amountA_ >= _amountAMin, 'LiquidityProxy: INSUFFICIENT_A_AMOUNT');
         require(amountB_ >= _amountBMin, 'LiquidityProxy: INSUFFICIENT_B_AMOUNT');
+
+        // refund excess bnb
+        if (msg.value > _liquidityFee)
+        {
+            TransferHelper.safeTransferETH(msg.sender, msg.value - _liquidityFee);
+        }
     }
 
     function removeLiquidityBnb(
@@ -140,8 +184,12 @@ contract LiquidityProxy
         uint _amountTokenMin,
         uint _amountBnbMin,
         address _to
-        ) external payable returns (uint amountToken_, uint amountBnb_)
+        ) external payable
+        returns (uint amountToken_, uint amountBnb_)
     {
+        uint256 _liquidityFee = liquidityFee(_token, address(0));
+        require(_liquidityFee <= msg.value, "LiquidityProxy: Insufficient fee");
+
         (amountToken_, amountBnb_) = removeLiquidity(
             _tokenLp,
             _token,
@@ -154,6 +202,12 @@ contract LiquidityProxy
         IERC20(_token).safeTransfer(_to, amountToken_);
         IWETH(WBNB).withdraw(amountBnb_);
         TransferHelper.safeTransferETH(_to, amountBnb_);
+
+        // refund excess bnb
+        if (msg.value > _liquidityFee)
+        {
+            TransferHelper.safeTransferETH(msg.sender, msg.value - _liquidityFee);
+        }
     }
 
     /* ======== OPERATOR FUNCTIONS ======== */
@@ -161,6 +215,18 @@ contract LiquidityProxy
     function setOperator(address _operator) external onlyOperator
     {
         operator = _operator;
+    }
+
+    function setFeeAmount(uint256 _feeAmount) external onlyOperator
+    {
+        feeAmount = _feeAmount;
+        emit FeeAmountChanged(_feeAmount);
+    }
+
+    function setFeeExcluded(address _token, bool _excluded) external onlyOperator
+    {
+        feeExcluded[_token] = _excluded;
+        emit TokenExclusionChanged(_token, _excluded);
     }
 
     function recoverBnb(uint256 _amount, address _to) external onlyOperator
@@ -184,7 +250,7 @@ contract LiquidityProxy
     {
         require(_amountA > 0, 'RouterProxy: INSUFFICIENT_AMOUNT');
         require(_reserveA > 0 && _reserveB > 0, 'RouterProxy: INSUFFICIENT_LIQUIDITY');
-        amountB_ = _amountA.mul(_reserveB) / _reserveA;
+        amountB_ = _amountA * _reserveB / _reserveA;
     }
 
     function getReservesInner(
